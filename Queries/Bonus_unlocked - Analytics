@@ -1,0 +1,241 @@
+CREATE TABLE jpatel.rutgers_2020_bonus_unlocked AS 
+
+-- 1. FETCH MOST RECENT ROWS WITHIN REPORTING DATE RANGE
+
+-- 2. CLEAN TABLES BY JOINING MAX ROWS IN DATE RANGE
+
+
+-- FREE BET WAGERED
+WITH nj_users AS (
+    SELECT DISTINCT dupi AS DUPI
+                    ,u.id AS user_id
+                    ,betworks_customer_id
+    FROM identity_db.users AS u
+    JOIN identity_db.regions AS r ON r.id = u.registration_region_id AND r.iso_3166_2_code = 'US-NJ'
+    WHERE is_tester = 'false' AND is_inactive = 'false' AND
+        dupi IS NOT NULL AND registration_completed_at IS NOT NULL --AND u.id = 'd70206f9-c5d2-4705-831c-8e60c3f9012e'
+)
+
+
+, dr_free_bet AS  (
+SELECT DISTINCT ledger_transaction_id
+        , patron_transaction_id
+        , a_patron_id AS patron_id
+        , a_type
+        , debit_cents
+        , t_updated_at AS updated_at
+        , b.id AS bet_id
+        , free_bet_id
+        , b.gaming_state
+FROM edgebook_all.nj_accounting_tables AS a
+INNER JOIN edgebook_all.bets AS b
+    ON a.p_bet_id=b.id
+WHERE p_type='sportsbook_free_bet'
+    AND a_type='sportsbook_bonus_expense'
+    AND debit_cents>0
+    AND free_bet_id IS NOT NULL
+)
+
+, cr_free_bet AS  (
+SELECT DISTINCT ledger_transaction_id
+        , patron_transaction_id
+        , a_patron_id AS patron_id
+        , a_type
+        , credit_cents
+        , t_updated_at AS updated_at
+        , b.id AS bet_id
+        , free_bet_id
+        , b.gaming_state
+FROM edgebook_all.nj_accounting_tables AS a
+INNER JOIN edgebook_all.bets AS b
+        ON a.p_bet_id=b.id
+WHERE p_type='sportsbook_free_bet'
+    AND a_type='sportsbook_unsettled_bets'
+    AND credit_cents>0
+    AND free_bet_id IS NOT NULL
+)
+
+-- FREE BET VOIDED
+, dr_free_bet_void AS  (
+SELECT DISTINCT ledger_transaction_id
+        , patron_transaction_id
+        , a_patron_id AS patron_id
+        , a_type
+        , debit_cents
+        , t_updated_at AS updated_at
+        , b.id AS bet_id
+        , free_bet_id
+        , b.gaming_state
+FROM edgebook_all.nj_accounting_tables AS a
+INNER JOIN edgebook_all.bets AS b
+        ON a.p_bet_id=b.id
+WHERE p_type='sportsbook_bet_void'
+    AND a_type='sportsbook_unsettled_bets'
+    AND debit_cents>0
+    AND free_bet_id IS NOT NULL
+)
+
+, cr_free_bet_void AS  (
+SELECT DISTINCT ledger_transaction_id
+        , patron_transaction_id
+        , a_patron_id AS patron_id
+        , a_type
+        , credit_cents
+        , t_updated_at AS updated_at
+        , b.id AS bet_id
+        , free_bet_id
+        , b.gaming_state
+FROM edgebook_all.nj_accounting_tables AS a
+INNER JOIN edgebook_all.bets AS b
+        ON a.p_bet_id=b.id
+WHERE p_type='sportsbook_bet_void'
+    AND a_type='sportsbook_bonus_expense'
+    AND credit_cents>0
+    AND free_bet_id IS NOT NULL
+)
+
+-- BONUS CASH
+-- Bonus Playthrough
+, dr_bonus_converted AS  (
+    SELECT DISTINCT ledger_transaction_id
+        , patron_transaction_id
+        , a_patron_id AS patron_id
+        , a_type
+        , debit_cents
+        , t_updated_at AS updated_at
+        , SPLIT_PART(external_id,':',2) AS bonus_id
+        , gaming_state
+    FROM edgebook_all.nj_accounting_tables
+    WHERE p_type='bonus_offer_payout'
+        AND a_type='sportsbook_bonus_expense'
+        AND debit_cents>0
+        AND external_id IS NOT NULL
+)
+
+, cr_bonus_converted AS  (
+    SELECT DISTINCT ledger_transaction_id
+        , patron_transaction_id
+        , a_patron_id AS patron_id
+        , a_type
+        , credit_cents
+        , t_updated_at AS updated_at
+        , SPLIT_PART(external_id,':',2) AS bonus_id
+        , gaming_state
+    FROM edgebook_all.nj_accounting_tables
+    WHERE p_type='bonus_offer_payout'
+        AND a_type='customer_liability'
+        AND credit_cents>0
+        AND external_id IS NOT NULL
+)
+
+-- Bonus Playthrough Cancellation
+, dr_bonus_reverted AS  (
+    SELECT DISTINCT ledger_transaction_id
+        , patron_transaction_id
+        , a_patron_id AS patron_id
+        , a_type
+        , t_type
+        , debit_cents
+        , t_updated_at AS updated_at
+        , SPLIT_PART(external_id,':',2) AS bonus_id
+        , gaming_state
+    FROM edgebook_all.nj_accounting_tables
+    WHERE p_type='bonus_offer_revoked'
+        AND a_type='customer_liability'
+        AND debit_cents>0
+        AND external_id IS NOT NULL
+)
+
+, cr_bonus_reverted AS  (
+    SELECT DISTINCT ledger_transaction_id
+        , patron_transaction_id
+        , a_patron_id AS patron_id
+        , a_type
+        , credit_cents
+        , t_updated_at AS updated_at
+        , SPLIT_PART(external_id,':',2) AS bonus_id
+        , gaming_state
+    FROM edgebook_all.nj_accounting_tables
+    WHERE p_type='bonus_offer_revoked'
+        AND a_type='sportsbook_bonus_expense'
+        AND credit_cents>0
+        AND external_id IS NOT NULL
+)
+
+, dataset AS (
+SELECT  DATE_TRUNC('day',d.updated_at AT time zone 'utc' AT time zone 'America/Toronto')::DATE AS gaming_date
+    , d.patron_id::VARCHAR
+    , NULL::VARCHAR AS bet_id
+    , d.patron_transaction_id::VARCHAR AS transaction_id
+    , NULL::INTEGER AS free_bet_id
+    , d.bonus_id::INTEGER
+    , -1.0*debit_cents/100.0 as amount--::NUMERIC(64,2) AS amount
+    , 'Cash Bonus'::VARCHAR AS bonus_type
+    , 'Playthrough'::VARCHAR AS transaction_type
+    , d.gaming_state::VARCHAR
+FROM dr_bonus_converted AS d
+    INNER JOIN cr_bonus_converted AS c
+        ON d.ledger_transaction_id=c.ledger_transaction_id
+        AND debit_cents=credit_cents
+
+UNION ALL
+
+SELECT  DATE_TRUNC('day',d.updated_at AT time zone 'utc' AT time zone 'America/Toronto')::DATE AS gaming_date
+    , d.patron_id::VARCHAR
+    , NULL::VARCHAR AS bet_id
+    , d.patron_transaction_id::VARCHAR AS transaction_id
+    , NULL::INTEGER AS free_bet_id
+    , d.bonus_id::INTEGER
+    , debit_cents/100.0 as amount--::NUMERIC(64,2) AS amount
+    , 'Cash Bonus'::VARCHAR AS bonus_type
+    , 'Playthrough Cancellation'::VARCHAR AS transaction_type
+    , d.gaming_state::VARCHAR
+    FROM dr_bonus_reverted AS d
+    INNER JOIN cr_bonus_reverted AS c
+        ON d.ledger_transaction_id=c.ledger_transaction_id
+        AND debit_cents=credit_cents
+
+UNION ALL
+
+SELECT DATE_TRUNC('day',d.updated_at AT time zone 'utc' AT time zone 'America/Toronto')::DATE AS gaming_date
+    , d.patron_id::VARCHAR
+    , d.bet_id::VARCHAR
+    , NULL::VARCHAR AS transaction_id
+    , d.free_bet_id::INTEGER
+    , NULL::INTEGER AS bonus_id
+    , -1.0*debit_cents/100.0 as amount--::NUMERIC(64,2) AS amount
+    , 'Free Bet'::VARCHAR AS bonus_type
+    , 'Free Bet'::VARCHAR AS transaction_type
+    , d.gaming_state::VARCHAR
+FROM dr_free_bet AS d
+    INNER JOIN cr_free_bet AS c
+        ON d.ledger_transaction_id=c.ledger_transaction_id
+        AND debit_cents=credit_cents
+
+UNION ALL
+
+SELECT DATE_TRUNC('day',d.updated_at AT time zone 'utc' AT time zone 'America/Toronto')::DATE AS gaming_date
+    , d.patron_id::VARCHAR
+    , d.bet_id::VARCHAR
+    , NULL::VARCHAR AS transaction_id
+    , d.free_bet_id::INTEGER
+    , NULL::INTEGER AS bonus_id
+    , 1.0*debit_cents/100.0 as amount--::NUMERIC(64,2) AS amount
+    , 'Free Bet'::VARCHAR AS bonus_type
+    , 'Free Bet Voided'::VARCHAR AS transaction_type
+    , d.gaming_state::VARCHAR
+FROM dr_free_bet_void AS d
+    INNER JOIN cr_free_bet_void AS c
+        ON d.ledger_transaction_id=c.ledger_transaction_id
+        AND debit_cents=credit_cents
+)
+
+SELECT d.*
+    , getdate() AT time zone 'America/Toronto' AS report_run_timestamp_toronto
+FROM dataset AS d
+INNER JOIN nj_users AS u
+    ON d.patron_id=u.user_id
+WHERE EXTRACT(YEAR FROM gaming_date) = '2020'
+--WHERE gaming_date>='2020-08-25'
+--    AND u.is_tester='false'
+ORDER BY 8, 9, 1;
